@@ -511,3 +511,157 @@ def test_22_optimal_preview_persists_and_publishes(client):
     r = client.post(f"/api/plans/{plan_id}/publish")
     assert r.status_code == 200, r.text
     assert r.json()["optimality_status"] == "optimal"
+
+
+def test_23_solver_unknown_yields_unproven_without_candidate():
+    """求解器层：阶段求解返回 UNKNOWN -> unproven 且无候选，feasible=False。"""
+    from ortools.sat.python import cp_model
+
+    from app import solver as slv
+
+    spec = slv.SolveSpec(
+        fixtures=[slv.FixtureSpec(i, f"F{i}", 10, None, None, False) for i in (1, 2)],
+        reservations=[],
+        lines=[slv.LineSpec(i, f"L{i}", True) for i in range(1, 5)],
+    )
+
+    real_cls = cp_model.CpSolver
+
+    class AlwaysUnknown(real_cls):
+        def Solve(self, model):  # noqa: N802
+            super().Solve(model)
+            return cp_model.UNKNOWN
+
+    slv.cp_model.CpSolver = AlwaysUnknown
+    try:
+        r = slv.solve(spec)
+    finally:
+        slv.cp_model.CpSolver = real_cls
+
+    assert r.optimality == slv.UNPROVEN
+    assert r.unproven_stage == "migration"
+    assert r.allocations == []
+    assert r.feasible is False  # 空候选：不是可行，也不是已证无解
+    assert r.has_candidate is False
+    assert r.conflicts and r.conflicts[0]["type"] == "unproven"
+
+
+def test_24_preview_unknown_status_empty_candidate(client):
+    """HTTP：求解返回 UNKNOWN -> 200 + feasible=false + unproven + 阶段信息，不生成草稿。"""
+    from ortools.sat.python import cp_model
+
+    from app import planner
+    from app.database import SessionLocal
+    from app.models import Plan
+
+    with SessionLocal() as db:
+        drafts_before = db.query(Plan).filter(Plan.status == "draft").count()
+
+    real_cls = cp_model.CpSolver
+
+    class AlwaysUnknown(real_cls):
+        def Solve(self, model):  # noqa: N802
+            super().Solve(model)
+            return cp_model.UNKNOWN
+
+    planner.solver.cp_model.CpSolver = AlwaysUnknown
+    try:
+        r = client.post("/api/plans/preview")
+    finally:
+        planner.solver.cp_model.CpSolver = real_cls
+
+    assert r.status_code == 200, r.text
+    p = r.json()
+    assert p["feasible"] is False  # 空候选不得误报为可行
+    assert p["optimality_status"] == "unproven"  # 也不是已证无解
+    assert p["unproven_stage"] == "migration"
+    assert p["message"]
+    assert p["allocations"] == [] and p["migrations"] == [] and p["occupancy"] == []
+    assert "plan_id" not in p and "id" not in p  # 未生成草稿
+    assert p["conflicts"] and p["conflicts"][0]["type"] == "unproven"
+
+    with SessionLocal() as db:
+        drafts_after = db.query(Plan).filter(Plan.status == "draft").count()
+    assert drafts_after == drafts_before
+
+
+def test_25_preview_candidate_read_failure_empty_candidate(client):
+    """HTTP：FEASIBLE 但候选读取失败 -> 同样按空候选裁决 feasible=false。"""
+    from ortools.sat.python import cp_model
+
+    from app import planner
+    from app import solver as slv
+
+    real_cls = cp_model.CpSolver
+    real_read = slv._read_chosen
+
+    class FirstFeasible(real_cls):
+        def __init__(self):
+            super().__init__()
+            self._n = 0
+
+        def Solve(self, model):  # noqa: N802
+            super().Solve(model)
+            self._n += 1
+            return cp_model.FEASIBLE if self._n == 1 else cp_model.OPTIMAL
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("模拟候选读取失败")
+
+    planner.solver.cp_model.CpSolver = FirstFeasible
+    slv._read_chosen = _boom
+    try:
+        r = client.post("/api/plans/preview")
+    finally:
+        planner.solver.cp_model.CpSolver = real_cls
+        slv._read_chosen = real_read
+
+    assert r.status_code == 200, r.text
+    p = r.json()
+    assert p["feasible"] is False
+    assert p["optimality_status"] == "unproven"
+    assert p["unproven_stage"] == "migration"
+    assert p["allocations"] == []
+    assert "plan_id" not in p and "id" not in p
+
+
+def test_26_preview_diagnosis_timeout_empty_candidate(client):
+    """HTTP：主模型 INFEASIBLE 且冲突诊断超时 -> unproven(diagnosis)，feasible=false。"""
+    from ortools.sat.python import cp_model
+
+    from app import planner
+
+    real_cls = cp_model.CpSolver
+    state = {"n": 0}
+
+    class InfeasibleThenUnknown(real_cls):
+        def Solve(self, model):  # noqa: N802
+            super().Solve(model)
+            state["n"] += 1
+            # 第一阶段报无解进入诊断；诊断求解超时（UNKNOWN）
+            return cp_model.INFEASIBLE if state["n"] == 1 else cp_model.UNKNOWN
+
+    planner.solver.cp_model.CpSolver = InfeasibleThenUnknown
+    try:
+        r = client.post("/api/plans/preview")
+    finally:
+        planner.solver.cp_model.CpSolver = real_cls
+
+    assert r.status_code == 200, r.text
+    p = r.json()
+    assert p["feasible"] is False
+    assert p["optimality_status"] == "unproven"  # 诊断超时不得当作已证无解
+    assert p["unproven_stage"] == "diagnosis"
+    assert p["allocations"] == []
+    assert any(c["type"] == "solver_timeout" for c in p["conflicts"])
+    assert "plan_id" not in p and "id" not in p
+
+
+def test_27_preview_recovers_after_empty_candidate(client):
+    """空候选事件后配置未被污染：正常预览仍可得最优并发布。"""
+    p = client.post("/api/plans/preview").json()
+    assert p["feasible"] is True
+    assert p["optimality_status"] == "optimal"
+    r = client.post(f"/api/plans/{p['plan_id']}/publish")
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is True

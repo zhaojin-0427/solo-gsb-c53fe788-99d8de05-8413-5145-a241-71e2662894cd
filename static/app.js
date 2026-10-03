@@ -383,18 +383,31 @@ function renderPreview(p) {
   const allocPanel = $("#alloc-panel");
 
   if (p.optimality_status === "unproven") {
-    // 可行但未证最优：展示候选，同时明确不可发布。
+    // 未证最优：一律不可发布。按是否取得完整可用排布（feasible）分两种展示——
+    // 有候选：展示候选排布仅供参考；空候选：暂无可展示排布，且不当作已证无解。
+    const hasCandidate = p.feasible && Array.isArray(p.allocations) && p.allocations.length > 0;
     unprovenPanel.classList.remove("hidden");
     $("#unproven-msg").textContent = p.message || "未能在限定时间内证明最优。";
+    $("#unproven-detail").textContent = hasCandidate
+      ? "求解器在限定时间内只找到可行候选，未能逐级证明“迁移台数最少 → 启用线路数最少 → 字典序最小”。下列排布仅供参考，未生成可发布草稿；请减少灯具数量或稍后重新生成预览。"
+      : "求解器在限定时间内未取得任何可展示的候选排布（暂无可展示排布）。这不是已证明无解：约束可能仍有可行排布，只是本次求解未能取得。未生成草稿，也不能发布；请减少灯具数量、放宽部分锁定或稍后重新生成预览。";
     conflictPanel.classList.add("hidden");
-    allocPanel.classList.remove("hidden");
-    $("#plan-summary").textContent =
-      `候选预览（未证最优，不可发布）· 基于配置 v${p.config_version}` +
-      ` · 迁移 ${p.migration_count} 台 · 启用 ${p.used_lines} 条线路`;
-    renderTracks(p.occupancy);
-    renderMigrations(p.migrations);
-    renderAllocations(p.allocations);
     $("#btn-publish").disabled = true;
+    if (hasCandidate) {
+      allocPanel.classList.remove("hidden");
+      $("#plan-summary").textContent =
+        `候选预览（未证最优，不可发布）· 基于配置 v${p.config_version}` +
+        ` · 迁移 ${p.migration_count} 台 · 启用 ${p.used_lines} 条线路`;
+      renderTracks(p.occupancy);
+      renderMigrations(p.migrations);
+      renderAllocations(p.allocations);
+    } else {
+      migrationPanel.classList.add("hidden");
+      allocPanel.classList.add("hidden");
+      $("#tracks").innerHTML = "";
+      $("#plan-summary").textContent =
+        `暂无可展示排布（未证最优，未生成草稿）· 基于配置 v${p.config_version}`;
+    }
     return;
   }
 

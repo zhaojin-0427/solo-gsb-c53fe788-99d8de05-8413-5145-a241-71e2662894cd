@@ -12,7 +12,9 @@
 
 每个阶段只接受 CP-SAT 的 OPTIMAL：限时内仅得到 FEASIBLE（可行 incumbent）
 时返回“未证最优”（unproven）状态，与真正的 INFEASIBLE 明确区分，且不会
-把未证明的取值固定后继续后续阶段。
+把未证明的取值固定后继续后续阶段。若求解返回 UNKNOWN 或候选读取失败，
+unproven 结果不带任何候选排布（allocations 为空），此时 feasible 为 False，
+只表示“暂无可展示排布”，不代表已证明无解。
 
 无解时返回可读的冲突约束诊断。
 """
@@ -46,6 +48,29 @@ _UNPROVEN_MESSAGES = {
     "lexicographic": (
         "字典序破局阶段在限定时间内未能逐台证明（线路 ID、起始地址）字典序最小；"
         "未生成可发布草稿，请重试。"
+    ),
+}
+
+# 求解返回 UNKNOWN 或候选读取失败时，连可行 incumbent 都没有：与“有候选但未证
+# 最优”区分开，明确这不是已证无解，只是暂无可展示排布。
+_DIAGNOSIS_TIMEOUT_MESSAGE = (
+    "冲突诊断阶段超时：无法证明冲突是否必然，也未取得可展示的候选排布；"
+    "这不代表已证明无解，请减少灯具数量或放宽部分锁定后重试。"
+)
+
+_UNPROVEN_NO_CANDIDATE_MESSAGES = {
+    "migration": (
+        "第一阶段（已配灯具迁移台数最少）在限定时间内未能证明最优，且未取得任何"
+        "可展示的候选排布；这不代表已证明无解，未生成可发布草稿，"
+        "请减少灯具数量或稍后重试。"
+    ),
+    "lines": (
+        "第二阶段（启用线路数最少）在限定时间内未能证明最优，且未取得任何"
+        "可展示的候选排布；这不代表已证明无解，未生成可发布草稿，请重试。"
+    ),
+    "lexicographic": (
+        "字典序破局阶段在限定时间内未能逐台证明（线路 ID、起始地址）字典序最小，"
+        "且未取得任何可展示的候选排布；这不代表已证明无解，未生成可发布草稿，请重试。"
     ),
 }
 
@@ -382,25 +407,15 @@ def _diagnose(spec: SolveSpec) -> SolveResult:
         return SolveResult(
             optimality=UNPROVEN,
             unproven_stage="diagnosis",
-            unproven_message="冲突诊断阶段超时：无法证明候选冲突是否必然，请减少灯具数量或放宽部分锁定后重试。",
-            conflicts=[
-                {
-                    "type": "solver_timeout",
-                    "message": "冲突诊断阶段超时：约束可能过于紧张，请减少灯具数量或放宽部分锁定后重试。",
-                }
-            ],
+            unproven_message=_DIAGNOSIS_TIMEOUT_MESSAGE,
+            conflicts=[{"type": "solver_timeout", "message": _DIAGNOSIS_TIMEOUT_MESSAGE}],
         )
     elif status == cp_model.UNKNOWN:
         return SolveResult(
             optimality=UNPROVEN,
             unproven_stage="diagnosis",
-            unproven_message="冲突诊断阶段超时：约束可能过于紧张，请减少灯具数量或放宽部分锁定后重试。",
-            conflicts=[
-                {
-                    "type": "solver_timeout",
-                    "message": "冲突诊断阶段超时：约束可能过于紧张，请减少灯具数量或放宽部分锁定后重试。",
-                }
-            ],
+            unproven_message=_DIAGNOSIS_TIMEOUT_MESSAGE,
+            conflicts=[{"type": "solver_timeout", "message": _DIAGNOSIS_TIMEOUT_MESSAGE}],
         )
 
     active_lines = [l for l in spec.lines if l.active]
@@ -520,15 +535,19 @@ def _allocations_from(spec: SolveSpec, sorted_fixtures, chosen: dict[int, tuple[
 def _unproven_result(stage: str, spec: SolveSpec, candidate: list[Allocation] | None) -> SolveResult:
     allocations = candidate or []
     occupancy = _build_occupancy(spec, allocations) if allocations else []
+    # 是否取得完整可用排布决定文案与 feasible 裁决：无候选时明确“不代表已证无解”。
+    message = (
+        _UNPROVEN_MESSAGES[stage] if allocations else _UNPROVEN_NO_CANDIDATE_MESSAGES[stage]
+    )
     return SolveResult(
         optimality=UNPROVEN,
         unproven_stage=stage,
-        unproven_message=_UNPROVEN_MESSAGES[stage],
+        unproven_message=message,
         allocations=allocations,
         migration_count=sum(1 for a in allocations if a.migrated),
         used_lines=sum(1 for line in occupancy if line["used_channels"] > 0),
         occupancy=occupancy,
-        conflicts=[{"type": "unproven", "message": _UNPROVEN_MESSAGES[stage]}],
+        conflicts=[{"type": "unproven", "message": message}],
     )
 
 

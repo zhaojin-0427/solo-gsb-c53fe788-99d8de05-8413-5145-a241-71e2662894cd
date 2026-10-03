@@ -65,8 +65,10 @@ def create_preview(db: Session) -> dict:
         }
 
     if not result.is_optimal:
-        # 存在可行候选但未能逐级证明最优：可展示，绝不生成可发布草稿。
-        return _candidate_payload(db, result, version)
+        # 未证最优：绝不生成可发布草稿。是否取得完整可用排布决定 feasible——
+        # 有候选则 feasible=True 供参考展示；空候选（UNKNOWN/候选读取失败/
+        # 诊断超时）则 feasible=False，仅表示暂无可展示排布，不代表已证无解。
+        return _unproven_payload(db, result, version)
 
     plan = Plan(
         config_version=version,
@@ -93,8 +95,14 @@ def create_preview(db: Session) -> dict:
     return _plan_payload(db, plan, feasible=True)
 
 
-def _candidate_payload(db: Session, result: solver.SolveResult, version: int) -> dict:
-    """未证最优时返回的候选预览（无 plan_id，不可发布）。"""
+def _unproven_payload(db: Session, result: solver.SolveResult, version: int) -> dict:
+    """未证最优时返回的预览（无 plan_id，不可发布）。
+
+    feasible 按是否取得完整可用排布裁决：有候选时为 True（仅供查看）；
+    空候选（求解 UNKNOWN、候选读取失败或冲突诊断超时）时为 False，
+    仍为 HTTP 200 并携带 unproven 状态与阶段信息，不当作已证无解。
+    """
+    has_candidate = result.feasible
     names = {f.id: f.name for f in db.query(Fixture).all()}
     locked_ids = {f.id for f in db.query(Fixture).filter(Fixture.locked.is_(True)).all()}
     prev = {f.id: (f.previous_line, f.previous_start, f.locked) for f in db.query(Fixture).all()}
@@ -127,7 +135,7 @@ def _candidate_payload(db: Session, result: solver.SolveResult, version: int) ->
                 }
             )
     return {
-        "feasible": True,
+        "feasible": has_candidate,
         "optimality_status": solver.UNPROVEN,
         "unproven_stage": result.unproven_stage,
         "message": result.unproven_message,
