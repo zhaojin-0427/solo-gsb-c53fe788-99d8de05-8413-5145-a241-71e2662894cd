@@ -29,7 +29,8 @@ SOLVE_SECONDS_TIE = 1.5
 LINE_PRIORITY_WEIGHT = 1024
 
 # 求解结论三态：optimal 已逐级证明最优；infeasible 已证明无解；
-# unproven 限时内只拿到可行候选，未能证明某一级最优。
+# unproven 限时内未能证明某一级最优——可能带回可行候选，也可能连一份
+# 完整可用的排布都没拿到（UNKNOWN / 候选读取失败 / 诊断超时，即“空候选”）。
 OPTIMAL = "optimal"
 INFEASIBLE = "infeasible"
 UNPROVEN = "unproven"
@@ -46,6 +47,23 @@ _UNPROVEN_MESSAGES = {
     "lexicographic": (
         "字典序破局阶段在限定时间内未能逐台证明（线路 ID、起始地址）字典序最小；"
         "未生成可发布草稿，请重试。"
+    ),
+}
+
+# 空候选（连一份完整可用排布都没拿到）时的文案：与“有候选”和“已证无解”都明确区分
+_UNPROVEN_EMPTY_MESSAGES = {
+    "migration": (
+        "第一阶段（已配灯具迁移台数最少）在限定时间内未取得完整可用的排布"
+        "（求解超时或候选读取失败）；这不是已证无解，未生成可发布草稿，"
+        "请减少灯具数量或稍后重试。"
+    ),
+    "lines": (
+        "第二阶段（启用线路数最少）在限定时间内未取得完整可用的排布"
+        "（求解超时或候选读取失败）；这不是已证无解，未生成可发布草稿，请重试。"
+    ),
+    "lexicographic": (
+        "字典序破局阶段在限定时间内未取得完整可用的排布（求解超时或候选读取失败）；"
+        "这不是已证无解，未生成可发布草稿，请重试。"
     ),
 }
 
@@ -108,7 +126,8 @@ class Allocation:
 
 @dataclass
 class SolveResult:
-    # optimal（逐级证明最优）/ infeasible（已证无解）/ unproven（存在可行候选但未证最优）
+    # optimal（逐级证明最优）/ infeasible（已证无解）/
+    # unproven（未证最优：可能带回可行候选，也可能是空候选）
     optimality: str
     allocations: list[Allocation] = field(default_factory=list)
     migration_count: int = 0
@@ -520,15 +539,18 @@ def _allocations_from(spec: SolveSpec, sorted_fixtures, chosen: dict[int, tuple[
 def _unproven_result(stage: str, spec: SolveSpec, candidate: list[Allocation] | None) -> SolveResult:
     allocations = candidate or []
     occupancy = _build_occupancy(spec, allocations) if allocations else []
+    # 空候选（UNKNOWN / 候选读取失败）与“有候选但未证最优”使用不同文案，
+    # 避免上游把空结果误读为可展示的候选预览
+    message = _UNPROVEN_MESSAGES[stage] if allocations else _UNPROVEN_EMPTY_MESSAGES[stage]
     return SolveResult(
         optimality=UNPROVEN,
         unproven_stage=stage,
-        unproven_message=_UNPROVEN_MESSAGES[stage],
+        unproven_message=message,
         allocations=allocations,
         migration_count=sum(1 for a in allocations if a.migrated),
         used_lines=sum(1 for line in occupancy if line["used_channels"] > 0),
         occupancy=occupancy,
-        conflicts=[{"type": "unproven", "message": _UNPROVEN_MESSAGES[stage]}],
+        conflicts=[{"type": "unproven", "message": message}],
     )
 
 
@@ -540,17 +562,21 @@ def _read_chosen(solver: cp_model.CpSolver, art: _ModelArtifacts, fixtures, line
     return chosen
 
 
+# 打包目标的最大取值必须保持在双精度可精确表示的整数范围内：CP-SAT 内部会以
+# double 处理目标界，目标值超过 2^53 后，末位台灯 ±1 的目标差将低于 double 精度，
+# 求解器可能把未证最优的 incumbent 误报为 OPTIMAL（已观测到非确定性错误结果）。
+_MAX_EXACT_DOUBLE_OBJECTIVE = 2**53
+
+
 def _max_packed_batch(n_lines: int) -> int:
-    """B 进制加权目标能在 int63 内打包多少台灯（base 见 LINE_PRIORITY_WEIGHT）。"""
-    base = LINE_PRIORITY_WEIGHT
-    digit_max = base * n_lines
-    cap = 2**62
+    """B 进制加权目标在目标值精确可表示（< 2^53）的前提下能打包多少台灯。"""
+    digit_max = LINE_PRIORITY_WEIGHT * n_lines
     k = 0
-    max_coeff = base  # 最末台灯的线路指数项系数
-    while k < 100 and max_coeff <= cap:
+    value_bound = 1  # 打包 k 台时目标值上界为 digit_max**k（不含）
+    while k < 100 and value_bound * digit_max <= _MAX_EXACT_DOUBLE_OBJECTIVE:
         k += 1
-        max_coeff *= digit_max
-    return k
+        value_bound *= digit_max
+    return max(k, 1)
 
 
 def _lexicographic_phase(spec, sorted_fixtures, line_ids, min_mig, min_used):

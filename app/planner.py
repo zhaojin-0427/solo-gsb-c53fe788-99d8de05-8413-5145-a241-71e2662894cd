@@ -65,8 +65,11 @@ def create_preview(db: Session) -> dict:
         }
 
     if not result.is_optimal:
-        # 存在可行候选但未能逐级证明最优：可展示，绝不生成可发布草稿。
-        return _candidate_payload(db, result, version)
+        # 未证最优：只有取得覆盖全部灯具的完整候选排布才算“有候选可展示”；
+        # 空候选（UNKNOWN / 候选读取失败 / 诊断超时）同样返回 200，但
+        # feasible=False，且与“已证无解”严格区分（optimality_status 仍为 unproven）。
+        has_candidate = result.has_candidate and len(result.allocations) == len(spec.fixtures)
+        return _candidate_payload(db, result, version, has_candidate=has_candidate)
 
     plan = Plan(
         config_version=version,
@@ -93,8 +96,27 @@ def create_preview(db: Session) -> dict:
     return _plan_payload(db, plan, feasible=True)
 
 
-def _candidate_payload(db: Session, result: solver.SolveResult, version: int) -> dict:
-    """未证最优时返回的候选预览（无 plan_id，不可发布）。"""
+def _candidate_payload(db: Session, result: solver.SolveResult, version: int, *, has_candidate: bool) -> dict:
+    """未证最优时返回的预览（无 plan_id，不生成草稿，不可发布）。
+
+    has_candidate=False 表示空候选：求解器连一份完整可用的排布都没拿到
+    （UNKNOWN / 候选读取失败 / 冲突诊断超时）。此时 feasible=False，
+    但 optimality_status 仍为 unproven —— 绝不是“已证无解”。
+    """
+    if not has_candidate:
+        return {
+            "feasible": False,
+            "optimality_status": solver.UNPROVEN,
+            "unproven_stage": result.unproven_stage,
+            "message": result.unproven_message,
+            "config_version": version,
+            "migration_count": 0,
+            "used_lines": 0,
+            "allocations": [],
+            "migrations": [],
+            "occupancy": [],
+            "conflicts": result.conflicts,
+        }
     names = {f.id: f.name for f in db.query(Fixture).all()}
     locked_ids = {f.id for f in db.query(Fixture).filter(Fixture.locked.is_(True)).all()}
     prev = {f.id: (f.previous_line, f.previous_start, f.locked) for f in db.query(Fixture).all()}

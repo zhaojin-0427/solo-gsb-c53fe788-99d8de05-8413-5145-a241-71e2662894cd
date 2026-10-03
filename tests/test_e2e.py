@@ -511,3 +511,192 @@ def test_22_optimal_preview_persists_and_publishes(client):
     r = client.post(f"/api/plans/{plan_id}/publish")
     assert r.status_code == 200, r.text
     assert r.json()["optimality_status"] == "optimal"
+
+
+def test_23_unknown_phase_yields_empty_candidate_not_feasible():
+    """第一阶段 UNKNOWN（连 incumbent 都没有）：unproven 且空候选，feasible=False。"""
+    from ortools.sat.python import cp_model
+
+    from app import solver as slv
+
+    spec = slv.SolveSpec(
+        fixtures=[slv.FixtureSpec(i, f"F{i}", 10, None, None, False) for i in (1, 2, 3)],
+        reservations=[],
+        lines=[slv.LineSpec(i, f"L{i}", True) for i in range(1, 5)],
+    )
+
+    real_cls = cp_model.CpSolver
+
+    class FirstUnknown(real_cls):
+        def __init__(self):
+            super().__init__()
+            self._n = 0
+
+        def Solve(self, model):  # noqa: N802
+            super().Solve(model)
+            self._n += 1
+            return cp_model.UNKNOWN if self._n == 1 else cp_model.OPTIMAL
+
+    slv.cp_model.CpSolver = FirstUnknown
+    try:
+        r = slv.solve(spec)
+    finally:
+        slv.cp_model.CpSolver = real_cls
+
+    assert r.optimality == slv.UNPROVEN
+    assert r.unproven_stage == "migration"
+    assert r.allocations == []
+    assert r.has_candidate is False
+    assert r.feasible is False  # 没有完整可用排布，不能算 feasible
+
+
+def test_24_preview_unknown_is_empty_unproven_no_draft(client):
+    """HTTP：第一阶段 UNKNOWN -> 200 + feasible=false + unproven，且不生成草稿。"""
+    from ortools.sat.python import cp_model
+
+    from app import planner
+    from app.database import SessionLocal
+    from app.models import Plan
+
+    with SessionLocal() as db:
+        drafts_before = db.query(Plan).filter(Plan.status == "draft").count()
+
+    real_cls = cp_model.CpSolver
+
+    class FirstUnknown(real_cls):
+        def __init__(self):
+            super().__init__()
+            self._n = 0
+
+        def Solve(self, model):  # noqa: N802
+            super().Solve(model)
+            self._n += 1
+            return cp_model.UNKNOWN if self._n == 1 else cp_model.OPTIMAL
+
+    planner.solver.cp_model.CpSolver = FirstUnknown
+    try:
+        r = client.post("/api/plans/preview")
+    finally:
+        planner.solver.cp_model.CpSolver = real_cls
+
+    assert r.status_code == 200, r.text
+    p = r.json()
+    assert p["feasible"] is False  # 空候选：不再误报为可行
+    assert p["optimality_status"] == "unproven"  # 但不是已证无解
+    assert p["unproven_stage"] == "migration"
+    assert "plan_id" not in p and "id" not in p  # 未生成草稿
+    assert p["allocations"] == [] and p["occupancy"] == []
+    assert p["conflicts"] and p["conflicts"][0]["type"] == "unproven"
+
+    with SessionLocal() as db:
+        drafts_after = db.query(Plan).filter(Plan.status == "draft").count()
+    assert drafts_after == drafts_before
+
+
+def test_25_preview_candidate_read_failure_is_empty_unproven(client):
+    """HTTP：第一阶段 FEASIBLE 但候选读取失败：同样按空候选处理（feasible=false）。"""
+    from ortools.sat.python import cp_model
+
+    from app import planner
+    from app import solver as slv
+
+    real_cls = cp_model.CpSolver
+    real_read = slv._read_chosen
+
+    class FirstFeasible(real_cls):
+        def __init__(self):
+            super().__init__()
+            self._n = 0
+
+        def Solve(self, model):  # noqa: N802
+            super().Solve(model)
+            self._n += 1
+            return cp_model.FEASIBLE if self._n == 1 else cp_model.OPTIMAL
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("simulated candidate read failure")
+
+    planner.solver.cp_model.CpSolver = FirstFeasible
+    slv._read_chosen = boom
+    try:
+        r = client.post("/api/plans/preview")
+    finally:
+        planner.solver.cp_model.CpSolver = real_cls
+        slv._read_chosen = real_read
+
+    assert r.status_code == 200, r.text
+    p = r.json()
+    assert p["feasible"] is False
+    assert p["optimality_status"] == "unproven"
+    assert p["unproven_stage"] == "migration"
+    assert p["allocations"] == []
+    assert "plan_id" not in p and "id" not in p
+
+
+def test_26_preview_diagnosis_timeout_is_empty_unproven(client):
+    """HTTP：硬约束模型被判 INFEASIBLE 后冲突诊断超时：unproven(diagnosis)，feasible=false。"""
+    from ortools.sat.python import cp_model
+
+    from app import planner
+    from app.database import SessionLocal
+    from app.models import Plan
+
+    with SessionLocal() as db:
+        drafts_before = db.query(Plan).filter(Plan.status == "draft").count()
+
+    real_cls = cp_model.CpSolver
+    calls = {"n": 0}
+
+    class InfeasibleThenUnknown(real_cls):
+        def Solve(self, model):  # noqa: N802
+            super().Solve(model)
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return cp_model.INFEASIBLE  # 第一阶段：声称无解，进入诊断
+            return cp_model.UNKNOWN  # 诊断阶段超时，连放宽后的 incumbent 都没有
+
+    planner.solver.cp_model.CpSolver = InfeasibleThenUnknown
+    try:
+        r = client.post("/api/plans/preview")
+    finally:
+        planner.solver.cp_model.CpSolver = real_cls
+
+    assert r.status_code == 200, r.text
+    p = r.json()
+    assert p["feasible"] is False
+    assert p["optimality_status"] == "unproven"  # 诊断超时 ≠ 已证无解
+    assert p["unproven_stage"] == "diagnosis"
+    assert any(c["type"] == "solver_timeout" for c in p["conflicts"])
+    assert "plan_id" not in p and "id" not in p
+
+    with SessionLocal() as db:
+        drafts_after = db.query(Plan).filter(Plan.status == "draft").count()
+    assert drafts_after == drafts_before
+
+
+def test_27_lexicographic_packing_stays_exact_and_deterministic():
+    """打包目标值必须保持在双精度精确整数范围内：60 台灯反复求解结果完全一致。
+
+    目标值超过 2^53 时，CP-SAT 内部基于 double 的推理无法分辨末位台灯 ±1 的
+    目标差，曾把未证最优的 incumbent 误报为 OPTIMAL（结果非确定）。
+    """
+    from app import solver as slv
+
+    # 4 条线路：4096**4 = 2**48 ≤ 2**53 可打包 4 台；4096**5 = 2**60 越界
+    assert slv._max_packed_batch(4) == 4
+
+    spec = slv.SolveSpec(
+        fixtures=[slv.FixtureSpec(i, f"F{i}", 10, None, None, False) for i in range(1, 61)],
+        reservations=[],
+        lines=[slv.LineSpec(i, f"L{i}", True) for i in range(1, 5)],
+    )
+    keys0 = None
+    for _ in range(5):
+        r = slv.solve(spec)
+        assert r.optimality == slv.OPTIMAL
+        keys = [(a.line_id, a.start) for a in sorted(r.allocations, key=lambda a: a.fixture_id)]
+        if keys0 is None:
+            keys0 = keys
+        assert keys == keys0  # 多次求解必须完全一致
+    by_id = {a.fixture_id: a for a in r.allocations}
+    assert (by_id[51].line_id, by_id[51].start) == (1, 501)
